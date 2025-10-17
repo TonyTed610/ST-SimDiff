@@ -3,10 +3,10 @@ import torch
 from torch import nn
 from collections import defaultdict, deque
 import math
+import random
 import torch.nn.functional as F
 import numpy as np
-from framefusion.fastcluster import FastSpectralClustering
-import random
+from simdiff.fastcluster import FastSpectralClustering
 TEXT_TOKEN = -1
 IGNORE_TOKEN = -2
 def calculate_percentiles(freq_dict, percentiles=[25, 50, 75]):
@@ -23,7 +23,7 @@ def calculate_percentiles(freq_dict, percentiles=[25, 50, 75]):
     if not freq_dict:
         return {}
     
-    # 方法1：将所有出现的项目展开成列表
+
     expanded_list = []
     for key, count in freq_dict.items():
         expanded_list.extend([key] * count)
@@ -84,70 +84,7 @@ def find_connected_components_dfs(edges):
     components.sort(key=lambda x: x[0] if x else float('inf'))
     return components
 
-def split_lists_by_value(data, cos_sim_func, alpha, beta, theta,strategy,hidden):
-    """
-    对二维列表进行基于value的智能拆分
-    
-    参数:
-    data: 二维列表
-    cos_sim_func: 计算列表value的函数，接受一个列表作为参数，返回一个数值
-    alpha: 长度阈值，超过此长度的列表需要拆分
-    beta: 拆分后每个子列表的最大长度
-    theta: value阈值，低于此值的列表需要拆分
-    
-    返回:
-    tuple: (处理后的二维列表, 对应的value列表)
-    """
-    if beta <= 0:
-        raise ValueError("beta必须大于0")
-    
-    result_lists = []
-    result_values = []
-    for sublist in data:
-        # 计算当前列表的value
-        current_value = cos_sim_func(strategy,hidden,sublist)
-        
-        # 判断是否需要拆分：长度超过alpha 或者 value低于theta
-        if len(sublist) > alpha and current_value < theta:
-            # 需要拆分的列表
-            split_sublists = random_split(sublist, beta)
-            
-            # 计算拆分后每个子列表的value
-            for split_sublist in split_sublists:
-                split_value = cos_sim_func(strategy,hidden,split_sublist)
-                result_lists.append(split_sublist)
-                result_values.append(split_value)
-        else:
-            # 不需要拆分的列表直接添加
-            result_lists.append(sublist)
-            result_values.append(current_value)
-    
-    return result_lists, result_values
 
-def random_split(lst, max_size):
-    """
-    将列表随机拆分为多个子列表，每个子列表长度不超过max_size
-    
-    参数:
-    lst: 要拆分的列表
-    max_size: 每个子列表的最大长度
-    
-    返回:
-    拆分后的子列表组成的列表
-    """
-    if not lst:
-        return []
-    
-    # 创建列表副本并随机打乱
-    shuffled_list = lst.copy()
-    random.shuffle(shuffled_list)
-    
-    # 按max_size大小进行拆分
-    result = []
-    for i in range(0, len(shuffled_list), max_size):
-        result.append(shuffled_list[i:i + max_size])
-    
-    return result
 def find_connected_components_union_find(edges):
     """
     使用并查集（Union-Find）找出图中的所有连通分量
@@ -218,32 +155,18 @@ def find_connected_components_union_find(edges):
             component_edges.append([])
     
     return components, component_edges
-def cos_sim_func(strategy,hidden_states,component):
-    if strategy==1:
-        return sum(component)
-    else:
-       
-        if hidden_states[0][component].shape[0] > 500:
-            # 如果大于1000，则随机取1000个向量来计算
-            idx = torch.randperm(hidden_states[0][component].shape[0])[:500]
-            components = hidden_states[0][component][idx]
-        else:
-            components = hidden_states[0][component]
-        cos_sim=F.cosine_similarity(components.unsqueeze(1),components.unsqueeze(0),dim=-1)
-        if strategy==2:
-            cos_sim_sum=cos_sim.float().sum()/2/(len(cos_sim)-1)
-        elif strategy==3:
-            cos_sim_sum=(cos_sim.float().sum()-len(cos_sim))/2/(len(cos_sim)-1)/len(cos_sim)
-        return cos_sim_sum.item()
-class FrameFusion(nn.Module):
-    def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1,padding=-1,strategy=2, right: bool = True, bottom: bool =True,):
-        super(FrameFusion, self).__init__()
+class SimDiff(nn.Module):
+    def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1,padding=-1,strategy=2, right: bool = True, bottom: bool =True, spatial: bool = True, temporal: bool = True, event_upper_bound=0.2):
+        super(SimDiff, self).__init__()
         self.cost = cost
         self.similarity_lower_bound = similarity_lower_bound
         self.ratio_lower_bound = ratio_lower_bound
+        self.event_upper_bound = event_upper_bound
         self.strategy=strategy
         self.right=right
         self.bottom=bottom
+        self.spatial = spatial
+        self.temporal = temporal
         self.padding=padding
 
     def prepare(
@@ -284,7 +207,7 @@ class FrameFusion(nn.Module):
         self, hidden_states, position_embeddings, attention_mask, self_attn_weights=None
     ):
         """
-        This is the forward method of the FrameFusion class.
+        This is the forward method of the SimDiff class.
 
         Args:
             hidden_states (torch.Tensor): A tensor of shape (batch_size, sequence_length, hidden_size).
@@ -301,7 +224,6 @@ class FrameFusion(nn.Module):
         device = hidden_states.device    
         # pruning
         if q_len >1 and self.finish_merging == True and self.finish_pruning == False:
-        # if q_len >1 and self.finish_pruning == False:
 
             image_token_pruning_start_index: int = self.image_token_start_index.item()
             image_token_pruning_length: int = (self.image_token_length - (self.original_length - q_len))
@@ -311,6 +233,7 @@ class FrameFusion(nn.Module):
             last_layer_attention_avg_image = last_layer_attention_avg[image_token_pruning_start_index:image_token_pruning_start_index+image_token_pruning_length]
 
             pruning_ratio = self._compute_pruning_ratio(self.sparsity_list, self.cost)
+            # print('prune ratio: ', pruning_ratio)
             top_attention_rank_index = (
                 last_layer_attention_avg_image.topk(
                     round(image_token_pruning_length * (1 - pruning_ratio))
@@ -341,27 +264,199 @@ class FrameFusion(nn.Module):
         # merging
         if q_len >1 and (not self.finish_merging):
             # align devices
-            token_mask = torch.ones(hidden_states.shape[:-1], dtype=torch.bool, device=device)
-            def random_select(mask,cost):
-                n=mask.shape[0]
-                m=int(10*(1-cost))
-                for start_idx in range(0, n, 10):
-                    end_idx = min(start_idx + 10, n)
-                    group_size = end_idx - start_idx
-                    
-                    # 如果当前组的大小小于m，则选择所有元素
-                    actual_m = min(m, group_size)
-                    
-                    # 当前组的索引
-                    group_indices = list(range(start_idx, end_idx))
-                    
-                    # 随机选择m个索引
-                    selected_group_indices = random.sample(group_indices, actual_m)
-                    mask[selected_group_indices]=0
-                return mask
-            self.sparsity_list.append(1-self.cost)
+            self.patch_type = self.patch_type.to(device)
+
+            # prefill
+            sparsity_upper_bound = self._compute_pruning_ratio(self.sparsity_list, self.cost)
+            # print('merge ratio: ', sparsity_upper_bound)
+            similarity_by_patch, token_index_by_patch = self.compute_similarity_and_token_index_by_patch(hidden_states, self.patch_type, self.patch_num) # only support bsz = 1
+
+            
+            frame_token_num = torch.sum(self.patch_type != TEXT_TOKEN).item()
+            # merge_index_by_patch = torch.where(similarity_by_patch >= self.similarity_lower_bound)[1]
+            # above_k_ratio = merge_index_by_patch.shape[0] / frame_token_num
+
+            graph=[]
+
+            event_token_ind = set()
+            change_threshold = self.event_upper_bound
+
+            ## 注释掉时间边
+            for index,_ in enumerate(similarity_by_patch[0]):
+                if similarity_by_patch[0][index] > -2 and similarity_by_patch[0][index]<change_threshold:
+                    event_token_ind.add(token_index_by_patch[0,index].item())
+                if self.temporal:
+                    if similarity_by_patch[0][index]>=self.similarity_lower_bound:
+                        graph.append(torch.tensor([token_index_by_patch[0,index-1],token_index_by_patch[0,index],similarity_by_patch[0][index].item()]))
+
+            if self.spatial:
+                right,bottom=self.compute_token_similarities_vectorized(
+                    hidden_states[0,self.image_token_start_index:self.image_token_end_index+1,:],
+                    self.n_frames,
+                    self.height,
+                    self.width
+                    )
+                
+                for f in range(self.n_frames):
+                    for h in range(self.height):
+                        for w in range(self.width):
+                            if right[f,h,w]>self.similarity_lower_bound:
+                                graph.append(torch.tensor([f*self.patch_num+h*self.width+w+self.image_token_start_index,f*self.patch_num+h*self.width+w+1+self.image_token_start_index,right[f,h,w]]))
+
+                for f in range(self.n_frames):
+                    for h in range(self.height):
+                        for w in range(self.width):
+                            if bottom[f,h,w]>self.similarity_lower_bound:
+                                graph.append(torch.tensor([f*self.patch_num+h*self.width+w+self.image_token_start_index,f*self.patch_num+(h+1)*self.width+w+self.image_token_start_index,bottom[f,h,w]]))
+            
             self.finish_merging=True
-            token_mask[0,self.image_token_start_index:self.image_token_end_index+1]=random_select(token_mask[0,self.image_token_start_index:self.image_token_end_index+1],self.cost)
+            token_mask = torch.ones(hidden_states.shape[:-1], dtype=torch.bool, device=device)
+            components_dfs = []
+            from pdb import set_trace
+            print('edges:',len(graph))
+            if len(graph)>0:
+                graph_tensor=torch.stack(graph)
+                
+
+                components_dfs,component_edges = find_connected_components_union_find(graph_tensor)
+                # print('num_component:',len(components_dfs))
+                # cal_coms={}
+                # for i in components_dfs:
+                #     if len(i) not in cal_coms:
+                #         cal_coms[len(i)]=1
+                #     else:
+                #         cal_coms[len(i)]+=1
+                # result,_=calculate_percentiles(dict(sorted(cal_coms.items())),percentiles=[90,99])
+                # unique_node=0
+                # temp_i=0
+                
+                # while temp_i <len(components_dfs):
+                #     if len(components_dfs[temp_i])>=result['99th percentile']:
+                #         components_dfs.pop(temp_i)
+                #         component_edges.pop(temp_i)
+                #     elif len(component_edges[temp_i])>0 and len(components_dfs[temp_i])<result['99th percentile'] and len(components_dfs[temp_i])>=result['90th percentile']:
+                #         c=FastSpectralClustering(n_clusters=math.ceil(len(components_dfs[temp_i])/5))
+                #         temp_component,_,_=c.fit_predict(component_edges[temp_i])
+                #         for item in temp_component:
+                #             if len(item)<=1:
+                #                 continue
+                #             components_dfs.append(item)
+                #             component_edges.append([])
+                #     else:
+                #         temp_i+=1
+                
+                unique_node=sum([len(i)for i in components_dfs])
+                #org_hidden_states, org_token_mask = self.merge_tokens_and_get_mask(hidden_states, similarity_by_patch, token_index_by_patch, merge_index_by_patch)
+                if len(components_dfs)>0:
+                    # above_k_number = unique_node-len(components_dfs)
+                    # print(above_k_number)
+                    # if above_k_number/ frame_token_num >= sparsity_upper_bound:
+                    # sparsity_ratio: merge比例
+
+                    sum_weight=torch.zeros(len(components_dfs))
+                    per_component_weight=[]
+                    if self.strategy==1:
+                        for index in range(len(components_dfs)):
+                            sum_weight[index]=sum(components_dfs[index])
+                    else:
+                        for index in range(len(components_dfs)):
+                            if len(components_dfs)==0:
+                                continue
+                            # print(hidden_states[0][components_dfs[index]].shape)
+                            # if hidden_states[0][components_dfs[index]].shape[0] > 1000:
+                            #     # 如果大于1000，则随机取1000个向量来计算
+                            #     idx = torch.randperm(hidden_states[0][components_dfs[index]].shape[0])[:1000]
+                            #     components = hidden_states[0][components_dfs[index]][idx]
+                            # else:
+                            #     components = hidden_states[0][components_dfs[index]]
+
+                            components = hidden_states[0][components_dfs[index]]
+                            components_norm = F.normalize(components, p=2, dim=1)
+                            cos_sim = torch.mm(components_norm, components_norm.T)
+                            per_component_weight.append(cos_sim.mean(dim=-1))
+                            if self.strategy==2:
+                                cos_sim_sum=cos_sim.float().sum()/2/(len(cos_sim)-1)
+                            elif self.strategy==3:
+                                cos_sim_sum=(cos_sim.float().sum()-len(cos_sim))/(len(cos_sim)-1)/len(cos_sim)
+                                # cos_sim_sum=(cos_sim.float().sum() - len(cos_sim))/(len(cos_sim)-1)/len(cos_sim)
+
+                            assert not ((torch.isinf(cos_sim_sum) or torch.isnan(cos_sim_sum)))
+                            sum_weight[index]=cos_sim_sum.item()
+                    _,indices=torch.sort(sum_weight, descending=True)
+                    # temp_index=0
+                    # while temp_index<len(indices)and above_k_number/ frame_token_num >= sparsity_upper_bound:
+                    #     temp_comp=components_dfs[indices[temp_index]]
+                    #     above_k_number-=(len(temp_comp)-1)
+                    #     temp_index+=1
+                    # for i in range(temp_index):
+                    #     components_dfs[indices[i]]=[]
+
+                    # 正式开始merge
+                    merge_token_num = 0
+                    for index in indices:
+                        merge_size = math.ceil(len(components_dfs[index]) * sparsity_upper_bound)
+      
+                        # 超额merge暂停
+                        if (merge_token_num + merge_size) / frame_token_num > sparsity_upper_bound:
+                            break
+
+                        # 按内部相似度从高到底选择merge_size个索引
+                        token_weight = per_component_weight[index]
+                        _, token_indices = torch.sort(token_weight, descending=True)
+                        for token_ind in token_indices[-merge_size:]:
+                            if components_dfs[index][token_ind] in event_token_ind:
+                                merge_size -= 1
+                                continue
+                            token_mask[0, components_dfs[index][token_ind]] = False
+    
+
+
+                        # _, token_indices = torch.sort(token_weight)
+                        # merged_num = 0
+                        # for token_ind in token_indices:
+                            # if components_dfs[index][token_ind] in event_token_ind:
+                            #     continue
+                            # else:
+                            # token_mask[0, components_dfs[index][token_ind]] = False
+                            # merged_num += 1
+
+                            # if merged_num == merge_size:
+                            #     break
+                            
+                            
+                        # # 随机选择merge_size个索引
+                        # for token_ind in random.sample(components_dfs[index], merge_size):
+                        #     token_mask[0, token_ind] = False
+
+                        # 全merge到一个token
+                        # for j in range(1,len(components_dfs[index])):
+                        #     token_mask[0, components_dfs[index][j]] = False
+                        #     hidden_states[0,components_dfs[index][0]]+=hidden_states[0,components_dfs[index][j]]
+                        # if len(components_dfs[index])>1:
+                        #     hidden_states[0,components_dfs[index][0]]/=(len(components_dfs[index])-1)
+
+                        merge_token_num += merge_size
+
+                    assert (merge_token_num / frame_token_num) == ((token_mask == False).sum().item() / frame_token_num)
+                    merge_ratio = merge_token_num / frame_token_num
+                    self.sparsity_list.append(merge_ratio)
+                    self.finish_merging=True
+                
+            
+            # diff=[]
+            # sims=[]
+            # for index,_ in enumerate(similarity_by_patch[0]):
+            #     if similarity_by_patch[0,index]>=self.similarity_lower_bound:
+            #         sims.append(token_index_by_patch[0][index])
+            # for index,_ in enumerate(org_token_mask[0]):
+                
+            #     if org_token_mask[0,index]!=token_mask[0,index]:
+            #         diff.append(index)
+            # assert (org_token_mask==token_mask).all()
+            # assert (org_hidden_states==hidden_states).all()
+            
+            # here only bsz=1
+            # update patch type
             self.patch_type = self.patch_type.to(device)[token_mask].reshape(bsz, -1)
             hidden_states = hidden_states[token_mask, :].reshape(bsz, -1, hidden_size)
             print('merge',q_len-hidden_states.shape[1])

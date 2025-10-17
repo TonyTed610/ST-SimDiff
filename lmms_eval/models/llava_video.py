@@ -155,7 +155,7 @@ class LlavaVideo(lmms):
 
         self._config = self._model.config
         self.model.eval()
-        from framefusion.interface import apply_framefusion
+        from simdiff.interface import apply_simdiff
         self.truncation = truncation
         self.batch_size_per_gpu = int(batch_size)
         self.conv_template = conv_template
@@ -197,9 +197,9 @@ class LlavaVideo(lmms):
             self._rank = 0
             self._world_size = 1
         if mm_spatial_pool_mode=='l2norm':
-            apply_framefusion(self.model, cost=cost, similarity_lower_bound=similarity_lower_bound, ratio_lower_bound=0.1,merge_args=merge_args,padding=padding)
+            apply_simdiff(self.model, cost=cost, similarity_lower_bound=similarity_lower_bound, ratio_lower_bound=0.1,merge_args=merge_args,padding=padding)
         else:
-            apply_framefusion(self.model, cost=cost, similarity_lower_bound=similarity_lower_bound, ratio_lower_bound=0.1,merge_args=merge_args)
+            apply_simdiff(self.model, cost=cost, similarity_lower_bound=similarity_lower_bound, ratio_lower_bound=0.1,merge_args=merge_args)
     @property
     def config(self):
         # return the associated transformers.AutoConfig for the given pretrained model.

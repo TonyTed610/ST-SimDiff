@@ -6,7 +6,7 @@ from transformers.models.qwen2.modeling_qwen2 import repeat_kv,apply_rotary_pos_
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils.doc import add_start_docstrings_to_model_forward
 
-from framefusion.utils import scaled_dot_product_attention
+from simdiff.utils import scaled_dot_product_attention
 
 def Qwen2DecoderLayer_merge_then_prune_by_cost_forward(
         self,
@@ -44,7 +44,7 @@ def Qwen2DecoderLayer_merge_then_prune_by_cost_forward(
 
         ### start token merging at layer 0 before attention
         if self.self_attn.layer_idx == 0:
-            hidden_states, position_embeddings, attention_mask = self.framefusion(hidden_states, position_embeddings, attention_mask)
+            hidden_states, position_embeddings, attention_mask = self.simdiff(hidden_states, position_embeddings, attention_mask)
         ### end token merging at layer 0 before attention
         
         residual = hidden_states
@@ -66,7 +66,7 @@ def Qwen2DecoderLayer_merge_then_prune_by_cost_forward(
 
         ### start token merging or fastv after attention
         if self.self_attn.layer_idx >= 1:
-            hidden_states, position_embeddings, attention_mask = self.framefusion(hidden_states, position_embeddings, attention_mask, self_attn_weights)
+            hidden_states, position_embeddings, attention_mask = self.simdiff(hidden_states, position_embeddings, attention_mask, self_attn_weights)
         ### end token merging or fastv after attention
     
         # Fully Connected
@@ -167,8 +167,8 @@ def Qwen2SdpaAttention_merge_then_prune_by_cost_forward(
     
     ### start storing attn_weights if needed
     attn_weights = None
-    if (q_len > 1) and (self.framefusion.finish_merging) and (not self.framefusion.finish_pruning):  
-    # if (q_len > 1) and (not self.framefusion.finish_pruning):        
+    if (q_len > 1) and (self.simdiff.finish_merging) and (not self.simdiff.finish_pruning):  
+    # if (q_len > 1) and (not self.simdiff.finish_pruning):        
         attn_weights = scaled_dot_product_attention(
             query_states,
             key_states,
@@ -303,7 +303,7 @@ def Qwen2Model_merge_then_fastv_cost_given_forward(
                     position_embeddings=position_embeddings,
                 )
 
-            ### start update the attention mask and position embeddings modified by framefusion
+            ### start update the attention mask and position embeddings modified by simdiff
             position_embeddings = layer_outputs[-2]
             causal_mask = layer_outputs[-1]
             ### end changing position embedding

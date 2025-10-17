@@ -6,16 +6,16 @@ import torch.nn as nn
 from accelerate.hooks import add_hook_to_module
 from transformers import PreTrainedModel
 
-# framefusion methods
+# simdiff methods
 
-from framefusion.utils import TEXT_TOKEN, IGNORE_TOKEN, get_attr_by_name
+from simdiff.utils import TEXT_TOKEN, IGNORE_TOKEN, get_attr_by_name
 
 # model types
 from transformers import LlavaNextVideoForConditionalGeneration
-from framefusion.models.nvila.llava_arch import _embed
+from simdiff.models.nvila.llava_arch import _embed
 try:
     from llava.model.language_model.llava_qwen import LlavaQwenForCausalLM
-    from framefusion.models.llava_video.modeling_llava_video import prepare_inputs_labels_for_multimodal_get_patch_type
+    from simdiff.models.llava_video.modeling_llava_video import prepare_inputs_labels_for_multimodal_get_patch_type
     SKIP_LLAVA_NEXT = False
 except ModuleNotFoundError:
     SKIP_LLAVA_NEXT = True
@@ -29,19 +29,19 @@ except:
     print("Skipping import from VILA")
 
 # replace methods
-from framefusion.models.llava_next_video.modeling_llava_next_video import _merge_input_ids_with_image_features_get_token_type
+from simdiff.models.llava_next_video.modeling_llava_next_video import _merge_input_ids_with_image_features_get_token_type
 
-from framefusion.models.minicpmv.modeling_minicpmv import get_vllm_embedding
-from framefusion.models.qwen2.modeling_qwen2 import Qwen2Model_merge_then_fastv_cost_given_forward, Qwen2DecoderLayer_merge_then_prune_by_cost_forward, Qwen2SdpaAttention_merge_then_prune_by_cost_forward
-def apply_framefusion(model, cost, similarity_lower_bound, ratio_lower_bound,merge_args=None,padding=-1):
+from simdiff.models.minicpmv.modeling_minicpmv import get_vllm_embedding
+from simdiff.models.qwen2.modeling_qwen2 import Qwen2Model_merge_then_fastv_cost_given_forward, Qwen2DecoderLayer_merge_then_prune_by_cost_forward, Qwen2SdpaAttention_merge_then_prune_by_cost_forward
+def apply_simdiff(model, cost, similarity_lower_bound, ratio_lower_bound,merge_args=None,padding=-1):
     """
-    Apply FrameFusion to the model
+    Apply SimDiff to the model
 
     Args:
-        model: the model to apply FrameFusion to
-        cost: the cost of the FrameFusion
-        similarity_lower_bound: the similarity lower bound of the FrameFusion
-        ratio_lower_bound: the ratio lower bound of the FrameFusion
+        model: the model to apply SimDiff to
+        cost: the cost of the SimDiff
+        similarity_lower_bound: the similarity lower bound of the SimDiff
+        ratio_lower_bound: the ratio lower bound of the SimDiff
     """
     # from pdb import set_trace; set_trace()
 
@@ -101,7 +101,7 @@ def apply_framefusion(model, cost, similarity_lower_bound, ratio_lower_bound,mer
     else:
         raise NotImplementedError
 
-    replace_framefusion_forward(
+    replace_simdiff_forward(
         model,
         cost=cost,
         similarity_lower_bound=similarity_lower_bound,
@@ -137,7 +137,7 @@ def get_token_type(model):
         raise NotImplementedError
 
 
-def replace_framefusion_forward(
+def replace_simdiff_forward(
     module: torch.nn.Module,
     cost: float,
     similarity_lower_bound: float,
@@ -152,36 +152,36 @@ def replace_framefusion_forward(
     padding: int =-1,
 ):
     """
-    Replace the forward method of the model with the framefusion forward method.
-    Make framefusion a property of the model.
+    Replace the forward method of the model with the simdiff forward method.
+    Make simdiff a property of the model.
 
     The keys are accessed in an hierarchical manner: llm_key -> decoder_key -> attention_key. Each key can have multiple hierarchies, e.g. "llm.model", which will be accessed by module.llm.model
     """
 
     if merge_args['merge_type']=='org':
-        from framefusion.main import FrameFusion
+        from simdiff.main import SimDiff
         merge_args.pop('merge_type')
-        framefusion = FrameFusion(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
+        simdiff = SimDiff(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
     elif merge_args['merge_type']=='new_topk':
-        from framefusion.new_topk import FrameFusion
+        from simdiff.new_topk import SimDiff
         merge_args.pop('merge_type')
-        framefusion = FrameFusion(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
+        simdiff = SimDiff(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
     elif merge_args['merge_type']=='random':
-        from framefusion.ran import FrameFusion
+        from simdiff.ran import SimDiff
         merge_args.pop('merge_type')
-        framefusion = FrameFusion(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
+        simdiff = SimDiff(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
     elif merge_args['merge_type']=='st_topk':
-        from framefusion.st_topk import FrameFusion
+        from simdiff.st_topk import SimDiff
         merge_args.pop('merge_type')
-        framefusion = FrameFusion(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
+        simdiff = SimDiff(cost, similarity_lower_bound, ratio_lower_bound,padding,**merge_args)
 
 
-    module.framefusion = framefusion
+    module.simdiff = simdiff
 
     llm = get_attr_by_name(module, llm_key)
     assert isinstance(llm, PreTrainedModel), f"{llm_key} is not a PreTrainedModel"
 
-    llm.framefusion = framefusion
+    llm.simdiff = simdiff
     llm.forward = MethodType(llm_forward, llm)
 
     # import pdb; pdb.set_trace()
@@ -190,7 +190,7 @@ def replace_framefusion_forward(
     for i, decoder_layer in enumerate(decoder_layers):
         assert isinstance(decoder_layer, nn.Module), f"{decoder_key}[{i}] is not a nn.Module"
 
-        decoder_layer.framefusion = framefusion
+        decoder_layer.simdiff = simdiff
         decoder_layer.forward = MethodType(decoder_forward, decoder_layer)
 
         # ensure accelerate hooks are not removed
@@ -202,5 +202,5 @@ def replace_framefusion_forward(
         assert isinstance(qwen2_attention_instance, nn.Module), f"{decoder_key}[{i}].self_attn is not a nn.Module"
 
         # replace the forward method of the attention layer
-        qwen2_attention_instance.framefusion = framefusion
+        qwen2_attention_instance.simdiff = simdiff
         qwen2_attention_instance.forward = MethodType(attention_forward, qwen2_attention_instance)

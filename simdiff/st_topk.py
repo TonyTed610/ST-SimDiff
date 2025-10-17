@@ -6,7 +6,7 @@ import math
 import random
 import torch.nn.functional as F
 import numpy as np
-from framefusion.fastcluster import FastSpectralClustering
+from simdiff.fastcluster import FastSpectralClustering
 TEXT_TOKEN = -1
 IGNORE_TOKEN = -2
 def calculate_percentiles(freq_dict, percentiles=[25, 50, 75]):
@@ -23,7 +23,7 @@ def calculate_percentiles(freq_dict, percentiles=[25, 50, 75]):
     if not freq_dict:
         return {}
     
-
+    # 方法1：将所有出现的项目展开成列表
     expanded_list = []
     for key, count in freq_dict.items():
         expanded_list.extend([key] * count)
@@ -155,19 +155,20 @@ def find_connected_components_union_find(edges):
             component_edges.append([])
     
     return components, component_edges
-class FrameFusion(nn.Module):
-    def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1,padding=-1,strategy=2, right: bool = True, bottom: bool =True, spatial: bool = True, temporal: bool = True, event_upper_bound=0.2):
-        super(FrameFusion, self).__init__()
+class SimDiff(nn.Module):
+    def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1,padding=-1,strategy=2, right: bool = True, bottom: bool =True, spatial: bool = True, temporal: bool = True, event: bool = True, diverse: bool = True):
+        super(SimDiff, self).__init__()
         self.cost = cost
         self.similarity_lower_bound = similarity_lower_bound
         self.ratio_lower_bound = ratio_lower_bound
-        self.event_upper_bound = event_upper_bound
         self.strategy=strategy
         self.right=right
         self.bottom=bottom
         self.spatial = spatial
         self.temporal = temporal
         self.padding=padding
+        self.event = event
+        self.diverse = diverse
 
     def prepare(
         self,
@@ -207,7 +208,7 @@ class FrameFusion(nn.Module):
         self, hidden_states, position_embeddings, attention_mask, self_attn_weights=None
     ):
         """
-        This is the forward method of the FrameFusion class.
+        This is the forward method of the SimDiff class.
 
         Args:
             hidden_states (torch.Tensor): A tensor of shape (batch_size, sequence_length, hidden_size).
@@ -273,21 +274,19 @@ class FrameFusion(nn.Module):
 
             
             frame_token_num = torch.sum(self.patch_type != TEXT_TOKEN).item()
-            # merge_index_by_patch = torch.where(similarity_by_patch >= self.similarity_lower_bound)[1]
-            # above_k_ratio = merge_index_by_patch.shape[0] / frame_token_num
+            merge_index_by_patch = torch.where(similarity_by_patch >= self.similarity_lower_bound)[1]
+            above_k_ratio = merge_index_by_patch.shape[0] / frame_token_num
 
             graph=[]
-
-            event_token_ind = set()
-            change_threshold = self.event_upper_bound
-
+            edge_type = []
             ## 注释掉时间边
-            for index,_ in enumerate(similarity_by_patch[0]):
-                if similarity_by_patch[0][index] > -2 and similarity_by_patch[0][index]<change_threshold:
-                    event_token_ind.add(token_index_by_patch[0,index].item())
-                if self.temporal:
+            if self.temporal:
+                for index,_ in enumerate(similarity_by_patch[0]):
+                    # if similarity_by_patch[0][index]<0:
+                    #     continue
                     if similarity_by_patch[0][index]>=self.similarity_lower_bound:
                         graph.append(torch.tensor([token_index_by_patch[0,index-1],token_index_by_patch[0,index],similarity_by_patch[0][index].item()]))
+                        edge_type.append(1)
 
             if self.spatial:
                 right,bottom=self.compute_token_similarities_vectorized(
@@ -302,145 +301,194 @@ class FrameFusion(nn.Module):
                         for w in range(self.width):
                             if right[f,h,w]>self.similarity_lower_bound:
                                 graph.append(torch.tensor([f*self.patch_num+h*self.width+w+self.image_token_start_index,f*self.patch_num+h*self.width+w+1+self.image_token_start_index,right[f,h,w]]))
-
+                                edge_type.append(0)
                 for f in range(self.n_frames):
                     for h in range(self.height):
                         for w in range(self.width):
                             if bottom[f,h,w]>self.similarity_lower_bound:
                                 graph.append(torch.tensor([f*self.patch_num+h*self.width+w+self.image_token_start_index,f*self.patch_num+(h+1)*self.width+w+self.image_token_start_index,bottom[f,h,w]]))
+                                edge_type.append(0)
+
+            import networkx as nx
+            def create_graph_from_tensor(edge_list, edge_types, node_info):
+                G = nx.Graph()
+                # 添加节点，并附上时空坐标信息
+                for node_idx, info in node_info.items():
+                    G.add_node(node_idx, frame=info[0], r=info[1], c=info[2])
+
+                # 添加边，并附上权重和类型信息
+                for i in range(len(edge_list)):
+                    u, v, weight = edge_list[i].tolist()
+                    edge_type = 'spatial' if edge_types[i] == 0 else 'temporal'
+                    G.add_edge(int(u), int(v), weight=weight, type=edge_type)
+                return G
             
-            self.finish_merging=True
+            node_info = {i: ((i-self.image_token_start_index.item()) // (self.height * self.width), ((i-self.image_token_start_index.item()) % (self.height * self.width)) // self.width, (i-self.image_token_start_index.item()) % self.width) for i in range(self.image_token_start_index, self.image_token_end_index+1)}
+            # 创建我们的图对象
+            G = create_graph_from_tensor(graph, edge_type, node_info)
+            print(f"图已创建，包含 {G.number_of_nodes()} 个节点和 {G.number_of_edges()} 条边。")
+
+            def get_representative_tokens(G):
+                """
+                计算每个节点的综合得分，用于寻找代表性Token。
+                """
+                # 1. 计算PageRank中心性 (考虑权重)
+                pagerank_scores = nx.pagerank(G, weight='weight')
+
+                token_scores = {}
+                for node in G.nodes():
+                    # 2. 计算时间稳定性和空间内聚性
+                    temporal_weights = []
+                    spatial_weights = []
+                    for neighbor in G.neighbors(node):
+                        edge_data = G.get_edge_data(node, neighbor)
+                        if edge_data['type'] == 'temporal':
+                            temporal_weights.append(edge_data['weight'])
+                        else:
+                            spatial_weights.append(edge_data['weight'])
+
+                    # 如果没有对应类型的邻居，则权重为0
+                    avg_temporal_weight = np.mean(temporal_weights) if temporal_weights else 0
+                    avg_spatial_weight = np.mean(spatial_weights) if spatial_weights else 0
+
+                    # 3. 计算综合得分 (超参数 alpha, beta, gamma 可调)
+                    alpha, beta, gamma = 2000, 0.5, 0.2
+                    final_score = (alpha * pagerank_scores.get(node, 0) +
+                                beta * avg_temporal_weight +
+                                gamma * avg_spatial_weight)
+                    token_scores[node] = final_score
+
+                # 返回按得分排序的Token列表
+                sorted_tokens = sorted(token_scores.keys(), key=lambda t: token_scores[t], reverse=True)
+                return sorted_tokens, token_scores
+
+            # --- 执行策略一 ---
+            # sorted_representative_tokens, representative_scores = get_representative_tokens(G)
+            # print(f"\n--- 策略一：代表性内容 ---")
+            # print(f"得分最高的5个Token: {sorted_representative_tokens[:5]}")
+
+            def get_event_tokens(G, change_threshold=0.1):
+                """
+                找出权重低于阈值的时间边，将其终点标记为“事件Token”。
+                """
+                event_tokens = set()
+                for u, v, data in G.edges(data=True):
+                    if data['type'] == 'temporal' and data['weight'] < change_threshold:
+                        # 变化发生在 u -> v 的过程中，所以 v 是事件发生后的Token
+                        # 我们需要知道哪个节点的帧号更大来确定方向
+                        if G.nodes[v]['frame'] > G.nodes[u]['frame']:
+                            event_tokens.add(v)
+                        else:
+                            event_tokens.add(u)
+
+                return list(event_tokens)
+
+            # --- 执行策略二 ---
+            # event_tokens = get_event_tokens(G, change_threshold=0.2) # 假设阈值为0.2
+            # print(f"\n--- 策略二：关键事件 ---")
+            # print(f"检测到的事件Token数量: {len(event_tokens)}")
+            # print(f"示例事件Token: {event_tokens[:5] if event_tokens else '无'}")
+
+            import community as community_louvain 
+            import cugraph
+            import cudf
+            def get_diverse_tokens(G, representative_scores):
+                """
+                通过社区发现，从每个社区中选出最核心的Token。
+                """
+                diverse_tokens = []
+                # 1. 使用louvain算法进行社区发现
+                # 它返回一个字典 {node: community_id, ...}
+                # partition = community_louvain.best_partition(G, weight='weight')
+                # 2. 使用 NetworkX 内置的新方法计算社区
+                # 它返回一个社区列表，每个社区是一个节点的集合 (set)
+                list_of_communities = nx.community.louvain_communities(G, weight='weight')
+
+                # 3. [关键步骤] 将 "list of sets" 格式转换为 "dictionary" 格式
+                partition = {}
+                # 遍历每个社区（set），并获取其索引作为社区ID
+                for community_id, community_nodes in enumerate(list_of_communities):
+                    # 遍历社区中的每个节点
+                    for node in community_nodes:
+                        # 将节点和其社区ID存入字典
+                        partition[node] = community_id
+                
+                # 将社区ID映射到节点列表
+                communities = {}
+                for node, community_id in partition.items():
+                    if community_id not in communities:
+                        communities[community_id] = []
+                    communities[community_id].append(node)
+                    
+                # 2. 从每个社区中选出代表
+                for community_id, nodes_in_community in communities.items():
+                    if not nodes_in_community:
+                        continue
+                    # 选择社区内“代表性得分”最高的那个节点作为代表
+                    # best_node_in_community = max(nodes_in_community, key=lambda n: representative_scores.get(n, 0))
+                    # diverse_tokens.append(best_node_in_community)
+
+                    # 选择社区内“代表性得分”最高的10%节点作为代表
+                    nodes_sorted = sorted(nodes_in_community, key=lambda n: representative_scores.get(n, 0), reverse=True)
+                    diverse_tokens.extend(nodes_sorted[:int(0.1*len(nodes_sorted))])
+                    
+                return diverse_tokens
+
+            # --- 执行策略三 ---
+            # 需要策略一的得分作为参考
+            # diverse_tokens = get_diverse_tokens(G, representative_scores)
+            # print(f"\n--- 策略三：内容多样性 ---")
+            # print(f"发现的社区数量: {len(set(diverse_tokens))}")
+            # print(f"各社区的代表Token (前5个): {diverse_tokens[:5]}")
+
+            from func_timeout import func_set_timeout
+
+            @func_set_timeout(600)
+            def filter_tokens_final(G, num_final_tokens=32):
+                """
+                整合三大策略，筛选出最终的Token集合。
+                """
+                # 1. 首先运行策略一和策略二，得到基础结果
+                sorted_rep_tokens, rep_scores = get_representative_tokens(G)
+                
+                # --- 开始整合 ---
+                final_selected_tokens = set()
+
+                # 优先添加所有事件Token，因为它们通常最重要
+                if self.event:
+                    event_tokens_set = set(get_event_tokens(G, change_threshold=0.2))
+                    final_selected_tokens.update(event_tokens_set)
+
+                # 2. 运行策略三，得到多样性代表
+                if self.diverse:
+                    diverse_tokens_set = set(get_diverse_tokens(G, rep_scores))
+                    # 添加多样性Token，保证覆盖面
+                    final_selected_tokens.update(diverse_tokens_set)
+
+                # 如果数量仍然不足，用代表性得分最高的Token进行补充
+                # 按照得分从高到低遍历
+                for token in sorted_rep_tokens:
+                    if len(final_selected_tokens) >= num_final_tokens:
+                        break
+                    final_selected_tokens.add(token)
+                    
+                return list(final_selected_tokens)
+
+            # --- 执行最终筛选 ---
+            final_tokens = filter_tokens_final(G, num_final_tokens=math.ceil(frame_token_num * (1-sparsity_upper_bound * 0.6)))
+
+            print(f"\n--- 最终筛选结果 ---")
+            print(f"最终筛选出的Token数量: {len(final_tokens)}")
+            print(f"最终Token列表 (部分): {final_tokens[:10]}")
+
             token_mask = torch.ones(hidden_states.shape[:-1], dtype=torch.bool, device=device)
-            components_dfs = []
-            from pdb import set_trace
-            print('edges:',len(graph))
-            if len(graph)>0:
-                graph_tensor=torch.stack(graph)
-                
-
-                components_dfs,component_edges = find_connected_components_union_find(graph_tensor)
-                # print('num_component:',len(components_dfs))
-                # cal_coms={}
-                # for i in components_dfs:
-                #     if len(i) not in cal_coms:
-                #         cal_coms[len(i)]=1
-                #     else:
-                #         cal_coms[len(i)]+=1
-                # result,_=calculate_percentiles(dict(sorted(cal_coms.items())),percentiles=[90,99])
-                # unique_node=0
-                # temp_i=0
-                
-                # while temp_i <len(components_dfs):
-                #     if len(components_dfs[temp_i])>=result['99th percentile']:
-                #         components_dfs.pop(temp_i)
-                #         component_edges.pop(temp_i)
-                #     elif len(component_edges[temp_i])>0 and len(components_dfs[temp_i])<result['99th percentile'] and len(components_dfs[temp_i])>=result['90th percentile']:
-                #         c=FastSpectralClustering(n_clusters=math.ceil(len(components_dfs[temp_i])/5))
-                #         temp_component,_,_=c.fit_predict(component_edges[temp_i])
-                #         for item in temp_component:
-                #             if len(item)<=1:
-                #                 continue
-                #             components_dfs.append(item)
-                #             component_edges.append([])
-                #     else:
-                #         temp_i+=1
-                
-                unique_node=sum([len(i)for i in components_dfs])
-                #org_hidden_states, org_token_mask = self.merge_tokens_and_get_mask(hidden_states, similarity_by_patch, token_index_by_patch, merge_index_by_patch)
-                if len(components_dfs)>0:
-                    # above_k_number = unique_node-len(components_dfs)
-                    # print(above_k_number)
-                    # if above_k_number/ frame_token_num >= sparsity_upper_bound:
-                    # sparsity_ratio: merge比例
-
-                    sum_weight=torch.zeros(len(components_dfs))
-                    per_component_weight=[]
-                    if self.strategy==1:
-                        for index in range(len(components_dfs)):
-                            sum_weight[index]=sum(components_dfs[index])
-                    else:
-                        for index in range(len(components_dfs)):
-                            if len(components_dfs)==0:
-                                continue
-                            # print(hidden_states[0][components_dfs[index]].shape)
-                            # if hidden_states[0][components_dfs[index]].shape[0] > 1000:
-                            #     # 如果大于1000，则随机取1000个向量来计算
-                            #     idx = torch.randperm(hidden_states[0][components_dfs[index]].shape[0])[:1000]
-                            #     components = hidden_states[0][components_dfs[index]][idx]
-                            # else:
-                            #     components = hidden_states[0][components_dfs[index]]
-
-                            components = hidden_states[0][components_dfs[index]]
-                            components_norm = F.normalize(components, p=2, dim=1)
-                            cos_sim = torch.mm(components_norm, components_norm.T)
-                            per_component_weight.append(cos_sim.mean(dim=-1))
-                            if self.strategy==2:
-                                cos_sim_sum=cos_sim.float().sum()/2/(len(cos_sim)-1)
-                            elif self.strategy==3:
-                                cos_sim_sum=(cos_sim.float().sum()-len(cos_sim))/(len(cos_sim)-1)/len(cos_sim)
-                                # cos_sim_sum=(cos_sim.float().sum() - len(cos_sim))/(len(cos_sim)-1)/len(cos_sim)
-
-                            assert not ((torch.isinf(cos_sim_sum) or torch.isnan(cos_sim_sum)))
-                            sum_weight[index]=cos_sim_sum.item()
-                    _,indices=torch.sort(sum_weight, descending=True)
-                    # temp_index=0
-                    # while temp_index<len(indices)and above_k_number/ frame_token_num >= sparsity_upper_bound:
-                    #     temp_comp=components_dfs[indices[temp_index]]
-                    #     above_k_number-=(len(temp_comp)-1)
-                    #     temp_index+=1
-                    # for i in range(temp_index):
-                    #     components_dfs[indices[i]]=[]
-
-                    # 正式开始merge
-                    merge_token_num = 0
-                    for index in indices:
-                        merge_size = math.ceil(len(components_dfs[index]) * sparsity_upper_bound)
-      
-                        # 超额merge暂停
-                        if (merge_token_num + merge_size) / frame_token_num > sparsity_upper_bound:
-                            break
-
-                        # 按内部相似度从高到底选择merge_size个索引
-                        token_weight = per_component_weight[index]
-                        _, token_indices = torch.sort(token_weight, descending=True)
-                        for token_ind in token_indices[-merge_size:]:
-                            if components_dfs[index][token_ind] in event_token_ind:
-                                merge_size -= 1
-                                continue
-                            token_mask[0, components_dfs[index][token_ind]] = False
-    
-
-
-                        # _, token_indices = torch.sort(token_weight)
-                        # merged_num = 0
-                        # for token_ind in token_indices:
-                            # if components_dfs[index][token_ind] in event_token_ind:
-                            #     continue
-                            # else:
-                            # token_mask[0, components_dfs[index][token_ind]] = False
-                            # merged_num += 1
-
-                            # if merged_num == merge_size:
-                            #     break
-                            
-                            
-                        # # 随机选择merge_size个索引
-                        # for token_ind in random.sample(components_dfs[index], merge_size):
-                        #     token_mask[0, token_ind] = False
-
-                        # 全merge到一个token
-                        # for j in range(1,len(components_dfs[index])):
-                        #     token_mask[0, components_dfs[index][j]] = False
-                        #     hidden_states[0,components_dfs[index][0]]+=hidden_states[0,components_dfs[index][j]]
-                        # if len(components_dfs[index])>1:
-                        #     hidden_states[0,components_dfs[index][0]]/=(len(components_dfs[index])-1)
-
-                        merge_token_num += merge_size
-
-                    assert (merge_token_num / frame_token_num) == ((token_mask == False).sum().item() / frame_token_num)
-                    merge_ratio = merge_token_num / frame_token_num
-                    self.sparsity_list.append(merge_ratio)
-                    self.finish_merging=True
+            token_mask[0, self.image_token_start_index:self.image_token_end_index+1] = False
+            token_mask[0, final_tokens] = True
+            # merge_token_num = 0
+            # assert (merge_token_num / frame_token_num) == ((token_mask == False).sum().item() / frame_token_num)
+            merge_ratio = (token_mask == False).sum().item() / frame_token_num
+            self.sparsity_list.append(merge_ratio)
+            self.finish_merging=True
                 
             
             # diff=[]

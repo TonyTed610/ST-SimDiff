@@ -1,148 +1,18 @@
 from typing import List
 import torch
 from torch import nn
-from collections import defaultdict, deque
 import math
-import torch.nn.functional as F
-from framefusion.cluster import GraphClustering
+
 TEXT_TOKEN = -1
 IGNORE_TOKEN = -2
-def find_connected_components_dfs(edges):
-    """
-    使用深度优先搜索（DFS）找出图中的所有连通分量
-    
-    参数:
-    edges: torch.Tensor, 形状为 [n, 2]，每行表示一条边连接的两个节点
-    
-    返回值:
-    list of lists: 每个子列表包含一个连通分量中的所有节点
-    """
-    # 构建邻接表
-    graph = defaultdict(list)
-    nodes = set()
-    
-    # 将edges转为numpy以便处理
-    if isinstance(edges, torch.Tensor):
-        edges = edges.numpy()
-    
-    # 创建邻接表并获取所有节点
-    for u, v in edges:
-        graph[u].append(v)
-        graph[v].append(u)  # 无向图
-        nodes.add(u)
-        nodes.add(v)
-    
-    # DFS函数
-    def dfs(node, component, visited):
-        visited[node] = True
-        component.append(node)
-        
-        for neighbor in graph[node]:
-            if not visited[neighbor]:
-                dfs(neighbor, component, visited)
-    
-    # 初始化访问状态
-    visited = {node: False for node in nodes}
-    components = []
-    
-    # 遍历所有节点，找出连通分量
-    for node in nodes:
-        if not visited[node]:
-            component = []
-            dfs(node, component, visited)
-            components.append(sorted(component))  # 排序以保持一致性
-    
-    # 按照第一个元素排序整个结果
-    components.sort(key=lambda x: x[0] if x else float('inf'))
-    return components
 
-
-def find_connected_components_union_find(edges):
-    """
-    使用并查集（Union-Find）找出图中的所有连通分量
-    
-    参数:
-    edges: torch.Tensor, 形状为 [n, 2]，每行表示一条边连接的两个节点
-    
-    返回值:
-    list of lists: 每个子列表包含一个连通分量中的所有节点
-    """
-    # 将edges转为numpy以便处理
-    if isinstance(edges, torch.Tensor):
-        edges = edges.numpy()
-    
-    # 获取所有节点
-    nodes = set()
-    for u, v in edges:
-        nodes.add(u)
-        nodes.add(v)
-    
-    # 初始化并查集
-    parent = {node: node for node in nodes}
-    
-    # 查找函数，带路径压缩
-    def find(x):
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-    
-    # 合并函数
-    def union(x, y):
-        parent[find(x)] = find(y)
-    
-    # 合并所有边连接的节点
-    for u, v in edges:
-        union(u, v)
-    
-    # 收集连通分量
-    components_dict = defaultdict(list)
-    for node in nodes:
-        components_dict[find(node)].append(node)
-    
-    # 转换为列表并排序
-    components = [sorted(comp) for comp in components_dict.values()]
-    components.sort(key=lambda x: x[0] if x else float('inf'))
-    
-    return components
-def compute_token_similarities_vectorized(tensor, frames, height, width):
-    """
-    使用向量化操作更高效地计算二维tensor中每个位置的token与其右侧和下侧token的余弦相似度
-    
-    参数与返回值同上
-    """
-
-    # 将tensor重塑为[frames, height, width, embedding_dim]
-    reshaped_tensor = tensor.reshape(frames,height,width, -1)
-    
-    # 初始化结果张量
-    right_similarities = torch.zeros(frames, height, width, device=tensor.device)
-    bottom_similarities = torch.zeros(frames, height, width, device=tensor.device)
-    
-    # 计算每个位置与右侧token的余弦相似度（向量化）
-    # 正则化每个token以计算余弦相似度
-    normalized_tokens = F.normalize(reshaped_tensor, p=2, dim=-1)
-    
-    # 右侧相似度（对于每一行，计算相邻tokens的点积）
-    
-    
-    # 下侧相似度（对于每一列，计算相邻tokens的点积）
-    for f in range(frames):
-        for w in range(width):
-            # 当前列所有tokens
-            current_col = normalized_tokens[f, :-1, w]  # 除了最后一行
-            next_row = normalized_tokens[f, 1:, w]      # 除了第一行
-            
-            # 计算相邻tokens的点积
-            similarities = torch.sum(current_col * next_row, dim=-1)
-            bottom_similarities[f, :-1, w] = similarities
-    
-    return right_similarities, bottom_similarities
-class FrameFusion(nn.Module):
-    def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1):
-        super(FrameFusion, self).__init__()
+class SimDiff(nn.Module):
+    def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1,padding=-1):
+        super(SimDiff, self).__init__()
         self.cost = cost
         self.similarity_lower_bound = similarity_lower_bound
         self.ratio_lower_bound = ratio_lower_bound
+        self.padding=padding
 
     def prepare(
         self,
@@ -154,6 +24,8 @@ class FrameFusion(nn.Module):
         original_length: int,
         finish_merging: bool = False,
         finish_pruning: bool = False,
+        height: int = None,
+        width: int = None,
         sparsity_list: List[float] = None,
     ):
         self.patch_type = patch_type
@@ -164,9 +36,12 @@ class FrameFusion(nn.Module):
         self.original_length = original_length
         self.finish_merging = finish_merging
         self.finish_pruning = finish_pruning
-        self.width=math.ceil(math.sqrt(patch_num))
-        self.height=self.width-1
-        self.n_frames=image_token_length // patch_num
+        if height:
+            self.height=height
+            self.width=width
+        else:
+            self.width=math.ceil(math.sqrt(patch_num))
+            self.height=self.width-1
         if sparsity_list is None:
             self.sparsity_list = []
         else:
@@ -176,7 +51,7 @@ class FrameFusion(nn.Module):
         self, hidden_states, position_embeddings, attention_mask, self_attn_weights=None
     ):
         """
-        This is the forward method of the FrameFusion class.
+        This is the forward method of the SimDiff class.
 
         Args:
             hidden_states (torch.Tensor): A tensor of shape (batch_size, sequence_length, hidden_size).
@@ -191,18 +66,23 @@ class FrameFusion(nn.Module):
         """
         bsz, q_len, hidden_size = hidden_states.size()
         device = hidden_states.device    
-
         # pruning
         if q_len >1 and self.finish_merging == True and self.finish_pruning == False:
 
-            image_token_pruning_start_index: int = self.image_token_start_index.item()
-            image_token_pruning_length: int = (self.image_token_length - (self.original_length - q_len))
+            def to_int(x):
+                return x.item() if isinstance(x, torch.Tensor) else int(x)
+            image_token_pruning_start_index = to_int(self.image_token_start_index)
+            image_token_pruning_length = to_int(self.image_token_length - (self.original_length - q_len))
+
 
             last_layer_attention = self_attn_weights
             last_layer_attention_avg = torch.mean(last_layer_attention, dim=(1,2))[0]
             last_layer_attention_avg_image = last_layer_attention_avg[image_token_pruning_start_index:image_token_pruning_start_index+image_token_pruning_length]
 
             pruning_ratio = self._compute_pruning_ratio(self.sparsity_list, self.cost)
+
+            print('length',image_token_pruning_length)
+            print('pruning',pruning_ratio)
             top_attention_rank_index = (
                 last_layer_attention_avg_image.topk(
                     round(image_token_pruning_length * (1 - pruning_ratio))
@@ -224,72 +104,92 @@ class FrameFusion(nn.Module):
             keep_indexs = keep_indexs.sort().values
 
             hidden_states = hidden_states[:,keep_indexs,:] 
-            position_embeddings[0] = position_embeddings[0][:,keep_indexs,:]
-            position_embeddings[1] = position_embeddings[1][:,keep_indexs,:]
+            print('prune',q_len-hidden_states.shape[1])
+            position_embeddings = self.position_embedding_handler_at_pruning(position_embeddings, keep_indexs)
+
+
             if attention_mask != None:
                 attention_mask = attention_mask[:,:,keep_indexs,:][:,:,:,keep_indexs]
             self.finish_pruning = True
-        sims=[]
+
         # merging
         if q_len >1 and (not self.finish_merging):
             # align devices
+            from pdb import set_trace
+            set_trace()
             self.patch_type = self.patch_type.to(device)
 
             # prefill
             sparsity_upper_bound = self._compute_pruning_ratio(self.sparsity_list, self.cost)
-            similarity_by_patch, token_index_by_patch = self.compute_similarity_hierarchical(hidden_states, self.patch_type, self.patch_num,2) # only support bsz = 1
+            similarity_by_patch, token_index_by_patch = self.compute_similarity_and_token_index_by_patch(hidden_states, self.patch_type, self.patch_num) # only support bsz = 1
 
-            
             frame_token_num = torch.sum(self.patch_type != TEXT_TOKEN).item()
-                
-            graph=[]
-            for cal_index in range(len(similarity_by_patch)):
-                for index,_ in enumerate(similarity_by_patch[cal_index][0]):
-                    if similarity_by_patch[cal_index][0][index]<=0:
-                        continue
+            merge_index_by_patch = torch.where(similarity_by_patch >= self.similarity_lower_bound)[1]
+            above_k_ratio = merge_index_by_patch.shape[0] / frame_token_num
+            set_trace()
+            if above_k_ratio < sparsity_upper_bound:
+                self.sparsity_list.append(above_k_ratio)
 
-                    graph.append([token_index_by_patch[0,index-cal_index].item(),token_index_by_patch[0,index].item(),similarity_by_patch[cal_index][0][index].item()])
+                if above_k_ratio < self.ratio_lower_bound:
+                    self.finish_merging = True
+            else:
+                topk_values, topk_indices = torch.topk(similarity_by_patch, int(sparsity_upper_bound*frame_token_num))
+                topk_indices, _ = torch.sort(topk_indices)
+                merge_index_by_patch = topk_indices[0]
 
-            clusterer = GraphClustering(torch.tensor(graph))
-            louvain_clusters = clusterer.label_propagation_clustering(seed=42)
+                self.finish_merging = True
+                self.finish_pruning = True
 
-            
-            token_mask = torch.ones(hidden_states.shape[:-1], dtype=torch.bool, device=device)
-            for index,item in enumerate(louvain_clusters):
-                louvain_clusters[index]=list(louvain_clusters[index])
-                louvain_clusters[index]=torch.tensor(louvain_clusters[index])
-                for j in range(1,len(louvain_clusters[index])):
-                    token_mask[0, louvain_clusters[index][j]] = False
-            unique_node=torch.flatten(torch.cat(louvain_clusters))
-            unique_node=torch.unique(unique_node)
-            self.sparsity_list.append((unique_node.shape[0]-len(louvain_clusters))/frame_token_num)
-            self.finish_merging=True
-
-
-                
-                
-            # diff=[]
-            # sims=[]
-            # for index,_ in enumerate(similarity_by_patch[0]):
-            #     if similarity_by_patch[0,index]>=self.similarity_lower_bound:
-            #         sims.append(token_index_by_patch[0][index])
-            # for index,_ in enumerate(org_token_mask[0]):
-                
-            #     if org_token_mask[0,index]!=token_mask[0,index]:
-            #         diff.append(index)
-            # assert (org_token_mask==token_mask).all()
-            # assert (org_hidden_states==hidden_states).all()
-            
+            hidden_states, token_mask = self.merge_tokens_and_get_mask(hidden_states, similarity_by_patch, token_index_by_patch, merge_index_by_patch)
             # here only bsz=1
             # update patch type
             self.patch_type = self.patch_type.to(device)[token_mask].reshape(bsz, -1)
             hidden_states = hidden_states[token_mask, :].reshape(bsz, -1, hidden_size)
-            position_embeddings[0] = position_embeddings[0][:,token_mask[0],:]
-            position_embeddings[1] = position_embeddings[1][:,token_mask[0],:]
+
+            position_embeddings = self.position_embedding_handler_at_merging(position_embeddings, token_mask)
+            print('merge',q_len-hidden_states.shape[1])
             if attention_mask is not None:
                 attention_mask = attention_mask[:,:,token_mask[0],:][:,:,:,token_mask[0]]
 
         return hidden_states, position_embeddings, attention_mask
+
+    def position_embedding_handler_at_pruning(self, position_embeddings, keep_indexs):
+        if type(position_embeddings) == list:
+            assert len(position_embeddings) == 2
+            if position_embeddings[0].ndim == 4:
+                position_embeddings[0] = position_embeddings[0][:,:,keep_indexs,:]
+                position_embeddings[1] = position_embeddings[1][:,:,keep_indexs,:]
+            else:
+                position_embeddings[0] = position_embeddings[0][:,keep_indexs,:]
+                position_embeddings[1] = position_embeddings[1][:,keep_indexs,:]
+        elif type(position_embeddings) == torch.Tensor:
+            if position_embeddings.ndim == 2:
+                position_embeddings = position_embeddings[:,keep_indexs]
+            else:
+                raise NotImplementedError("Only support 2D position embeddings")
+        else:
+            raise NotImplementedError("Only support list or tensor for position embeddings")
+        return position_embeddings
+    
+    
+    def position_embedding_handler_at_merging(self, position_embeddings, token_mask):
+        if type(position_embeddings) == list:
+            # (cos, sin)
+            assert len(position_embeddings) == 2
+            if position_embeddings[0].ndim == 4:
+                position_embeddings[0] = position_embeddings[0][:,:,token_mask[0],:]
+                position_embeddings[1] = position_embeddings[1][:,:,token_mask[0],:]
+            else:
+                position_embeddings[0] = position_embeddings[0][:,token_mask[0],:]
+                position_embeddings[1] = position_embeddings[1][:,token_mask[0],:]
+        elif type(position_embeddings) == torch.Tensor:
+            if position_embeddings.ndim == 2:
+                position_embeddings = position_embeddings[:,token_mask[0]]
+            else:
+                raise NotImplementedError("Only support 2D position embeddings")
+        else:
+            raise NotImplementedError("Only support list or tensor for position embeddings")
+        return position_embeddings
 
     @staticmethod
     def compute_similarity_and_token_index_by_patch(hidden_states, token_patch_type, patch_num):
@@ -337,7 +237,7 @@ class FrameFusion(nn.Module):
         )
 
         similarity_by_patch[token_patch_type_by_patch[:, :-1] != token_patch_type_by_patch[:, 1:]] = -2
-        # print(similarity_by_patch.shape)
+
         similarity_by_patch = torch.cat(
             (
                 torch.full(
@@ -350,72 +250,10 @@ class FrameFusion(nn.Module):
             ),
             dim=1,
         )
-        # print(similarity_by_patch.shape)
+
         assert similarity_by_patch.shape[1] == token_index_by_patch.shape[1]
         return similarity_by_patch, token_index_by_patch
-    @staticmethod
-    def compute_similarity_hierarchical(hidden_states, token_patch_type, patch_num,cal_num=1):
-        """
-        Compute the similarity between consecutive tokens of the same patch type and record the token index.
 
-        Args:
-            hidden_states (torch.Tensor): A tensor of shape (batch_size, sequence_length, hidden_size).
-            token_patch_type (torch.Tensor): A tensor indicating the patch type of each token in the sequence.
-            patch_num (int): The total number of patches of one image in the model.
-
-        Returns:
-            similarity_by_patch (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing
-                                                the cosine similarity between consecutive tokens of the
-                                                same patch type. Tokens from different patches are set to -2.
-            token_index_by_patch (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing
-                                                the token index corresponding to the new order after
-                                                sorting by patch type.
-
-        """
-
-        bsz, q_len, _ = hidden_states.size()
-        device = hidden_states.device
-
-        assert bsz == 1, "Only support batch size 1"
-
-        token_index_by_patch = []
-        similarity_by_patch = []
-
-        token_patch_type_by_patch, token_index_by_patch = torch.where(
-            token_patch_type == torch.arange(patch_num, device=device)[:, None]
-        )
-
-        # noqa: reshape to batch size = 1, with shape (batch_size, q_len),
-        token_patch_type_by_patch = token_patch_type_by_patch[None, :]
-        token_index_by_patch = token_index_by_patch[None, :]
-        sims=[]
-        for i in range(cal_num):
-            similarity_by_patch = cosine_similarity(
-                hidden_states[
-                    torch.arange(bsz, device=device), token_index_by_patch[:, :-i-1], :
-                ],
-                hidden_states[
-                    torch.arange(bsz, device=device), token_index_by_patch[:, i+1:], :
-                ],
-            )
-
-            similarity_by_patch[token_patch_type_by_patch[:, :-i-1] != token_patch_type_by_patch[:, i+1:]] = -2
-            # print(similarity_by_patch.shape)
-            similarity_by_patch = torch.cat(
-                (
-                    torch.full(
-                        size=(bsz, 1),
-                        fill_value=IGNORE_TOKEN,
-                        dtype=hidden_states.dtype,
-                        device=device,
-                    ),
-                    similarity_by_patch,
-                ),
-                dim=1,
-            )
-            sims.append(similarity_by_patch)
-        # print(similarity_by_patch.shape)
-        return sims, token_index_by_patch
     @staticmethod
     def merge_tokens_and_get_mask(hidden_states: torch.Tensor, similarity_by_patch, token_index_by_patch, merge_index_by_patch):
         """
@@ -493,7 +331,7 @@ class FrameFusion(nn.Module):
         ] /= (merge_nums[None, :, None] + 1)
 
         return hidden_states, keep_mask
-    
+
     @staticmethod
     def _compute_pruning_ratio(sparsity_list, cost, num_layers = 28):
         """

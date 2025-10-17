@@ -186,9 +186,9 @@ class Llava_OneVision(lmms):
             self.model.to(self._device)
             self._rank = 0
             self._world_size = 1
-        from framefusion.interface import apply_framefusion
-        apply_framefusion(self.model, cost=0.5, similarity_lower_bound=0.6, ratio_lower_bound=0.1)
-        apply_framefusion(self._model, cost=0.5, similarity_lower_bound=0.6, ratio_lower_bound=0.1)
+        from simdiff.interface import apply_simdiff
+        apply_simdiff(self.model, cost=0.5, similarity_lower_bound=0.6, ratio_lower_bound=0.1)
+        apply_simdiff(self._model, cost=0.5, similarity_lower_bound=0.6, ratio_lower_bound=0.1)
 
     @property
     def config(self):

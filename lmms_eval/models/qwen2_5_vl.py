@@ -124,8 +124,8 @@ class Qwen2_5_VL(lmms):
         else:
             self._rank = 0
             self._world_size = 1
-        from framefusion.interface import apply_framefusion
-        apply_framefusion(self.model, cost=cost, similarity_lower_bound=0.8, ratio_lower_bound=0.1,merge_args=merge_args)
+        from simdiff.interface import apply_simdiff
+        apply_simdiff(self.model, cost=cost, similarity_lower_bound=0.8, ratio_lower_bound=0.1,merge_args=merge_args)
 
 
 

@@ -16,8 +16,8 @@ except ImportError:
     # minference is not needed if streamingllm is not used
     streaming_forward = None
 
-from framefusion.utils import TEXT_TOKEN, IGNORE_TOKEN
-from framefusion.main import find_contigious_latter_index
+from simdiff.utils import TEXT_TOKEN, IGNORE_TOKEN
+from simdiff.main import find_contigious_latter_index
 
 """
 Utils

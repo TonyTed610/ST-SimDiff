@@ -103,7 +103,7 @@ def find_connected_components_union_find(edges):
     components.sort(key=lambda x: x[0] if x else float('inf'))
     
     return components
-def compute_token_similarities_vectorized(tensor, frames, height, width,interval):
+def compute_token_similarities_vectorized(tensor, frames, height, width):
     """
     使用向量化操作更高效地计算二维tensor中每个位置的token与其右侧和下侧token的余弦相似度
     
@@ -112,43 +112,41 @@ def compute_token_similarities_vectorized(tensor, frames, height, width,interval
 
     # 将tensor重塑为[frames, height, width, embedding_dim]
     reshaped_tensor = tensor.reshape(frames,height,width, -1)
-    total_tokens = height * width * frames
-    tokens_per_frame = height * width
     
-    # 初始化相似度tensor
-    right_similarity = torch.full((total_tokens,), -1.0, dtype=tensor.dtype, device=tensor.device)
-    down_similarity = torch.full((total_tokens,), -1.0, dtype=tensor.dtype, device=tensor.device)
-
-    valid_frames = frames - interval
+    # 初始化结果张量
+    right_similarities = torch.zeros(frames, height, width, device=tensor.device)
+    bottom_similarities = torch.zeros(frames, height, width, device=tensor.device)
+    
     # 计算每个位置与右侧token的余弦相似度（向量化）
     # 正则化每个token以计算余弦相似度
-    for frame in range(valid_frames):
-        # 当前帧的token索引范围
-        current_start = frame * tokens_per_frame
-        current_end = (frame + 1) * tokens_per_frame
-        
-        # 目标帧的token索引范围
-        target_start = (frame + interval) * tokens_per_frame
-        target_end = (frame + interval + 1) * tokens_per_frame
-        
-        # 获取当前帧和目标帧的tokens
-        current_tokens = tensor[current_start:current_end-1]  # shape: (tokens_per_frame, feature_dim)
-        target_tokens = tensor[target_start+1:target_end]     # shape: (tokens_per_frame, feature_dim)
-        
-        # 计算余弦相似度（批量计算）
-        right = F.cosine_similarity(current_tokens, target_tokens, dim=1)
-        current_tokens = tensor[current_start:current_end-width]  # shape: (tokens_per_frame, feature_dim)
-        target_tokens = tensor[target_start+width:target_end]     # shape: (tokens_per_frame, feature_dim)
-        down=F.cosine_similarity(current_tokens, target_tokens, dim=1)
-        # 由于在这个问题设定中，"右边"和"下边"都是指向同一个间隔帧的对应位置
-        # 所以右边和下边的相似度实际上是相同的
-        right_similarity[current_start:current_end-1] = right
-        down_similarity[current_start:current_end-width] = down
+    normalized_tokens = F.normalize(reshaped_tensor, p=2, dim=-1)
     
-    return right_similarity, down_similarity
-class FrameFusion(nn.Module):
+    # 右侧相似度（对于每一行，计算相邻tokens的点积）
+    for f in range(frames):
+        for h in range(height):
+            # 当前行所有tokens
+            current_row = normalized_tokens[f, h, :-1]  # 除了最后一列
+            next_col = normalized_tokens[f, h, 1:]      # 除了第一列
+            
+            # 计算相邻tokens的点积（已经正则化，所以点积等于余弦相似度）
+            similarities = torch.sum(current_row * next_col, dim=-1)
+            right_similarities[f, h, :-1] = similarities
+    
+    # 下侧相似度（对于每一列，计算相邻tokens的点积）
+    for f in range(frames):
+        for w in range(width):
+            # 当前列所有tokens
+            current_col = normalized_tokens[f, :-1, w]  # 除了最后一行
+            next_row = normalized_tokens[f, 1:, w]      # 除了第一行
+            
+            # 计算相邻tokens的点积
+            similarities = torch.sum(current_col * next_row, dim=-1)
+            bottom_similarities[f, :-1, w] = similarities
+    
+    return right_similarities, bottom_similarities
+class SimDiff(nn.Module):
     def __init__(self, cost=0.3, similarity_lower_bound=0.6, ratio_lower_bound=0.1):
-        super(FrameFusion, self).__init__()
+        super(SimDiff, self).__init__()
         self.cost = cost
         self.similarity_lower_bound = similarity_lower_bound
         self.ratio_lower_bound = ratio_lower_bound
@@ -185,7 +183,7 @@ class FrameFusion(nn.Module):
         self, hidden_states, position_embeddings, attention_mask, self_attn_weights=None
     ):
         """
-        This is the forward method of the FrameFusion class.
+        This is the forward method of the SimDiff class.
 
         Args:
             hidden_states (torch.Tensor): A tensor of shape (batch_size, sequence_length, hidden_size).
@@ -252,36 +250,52 @@ class FrameFusion(nn.Module):
             frame_token_num = torch.sum(self.patch_type != TEXT_TOKEN).item()
             merge_index_by_patch = torch.where(similarity_by_patch >= self.similarity_lower_bound)[1]
             above_k_ratio = merge_index_by_patch.shape[0] / frame_token_num
+            if above_k_ratio < sparsity_upper_bound:
+                
+                if above_k_ratio < self.ratio_lower_bound:
+                    self.finish_merging = True
+                
+                graph=[]
+                for index,_ in enumerate(similarity_by_patch[0]):
+                    if similarity_by_patch[0][index]<0:
+                        continue
+                    if similarity_by_patch[0][index]>=self.similarity_lower_bound:
+                        graph.append(torch.tensor([token_index_by_patch[0,index-1],token_index_by_patch[0,index]]))
+                        sims.append(similarity_by_patch[0][index].item())
+                
+            else:
+                topk_values, topk_indices = torch.topk(similarity_by_patch, int(sparsity_upper_bound*frame_token_num))
+                topk_indices, _ = torch.sort(topk_indices)
+                merge_index_by_patch = topk_indices[0]
 
-                
-            graph=[]
-            for index,_ in enumerate(similarity_by_patch[0]):
-                if similarity_by_patch[0][index]<0:
-                    continue
-                if similarity_by_patch[0][index]>=self.similarity_lower_bound:
-                    graph.append(torch.tensor([token_index_by_patch[0,index-1],token_index_by_patch[0,index]]))
-                    sims.append(similarity_by_patch[0][index].item())
-                
-            
+                self.finish_merging = True
+                self.finish_pruning = True
+                graph=[]
+                for index,i in enumerate(topk_indices[0]):
+                    
+                    graph.append(torch.tensor([token_index_by_patch[0,i.item()-1],token_index_by_patch[0,i.item()]]))
+                    sims.append(topk_values[0][index].item())
 
             if not self.finish_merging:
-                interval=1
                 right,bottom=compute_token_similarities_vectorized(
                     hidden_states[0,self.image_token_start_index:self.image_token_end_index+1,:],
                     self.n_frames,
                     self.height,
-                    self.width,
-                    interval
+                    self.width
                     )
-                for index,i in enumerate(right):
-                    if right[index]>self.similarity_lower_bound:
-                        graph.append(torch.tensor([self.image_token_start_index+index,self.patch_num*interval+self.image_token_start_index+1]))
-                        sims.append(right[index])
-                for index,i in enumerate(bottom):
-                    if bottom[index]>self.similarity_lower_bound:
-                        graph.append(torch.tensor([self.image_token_start_index+index,self.patch_num*interval+self.image_token_start_index+self.width]))
-                        sims.append(bottom[index])
                 
+                for f in range(self.n_frames):
+                    for h in range(self.height):
+                        for w in range(self.width):
+                            if right[f,h,w]>self.similarity_lower_bound:
+                                graph.append(torch.tensor([f*self.patch_num+h*self.width+w+self.image_token_start_index,f*self.patch_num+h*self.width+w+1+self.image_token_start_index]))
+                                sims.append(right[f,h,w])
+                for f in range(self.n_frames):
+                    for h in range(self.height):
+                        for w in range(self.width):
+                            if bottom[f,h,w]>self.similarity_lower_bound:
+                                graph.append(torch.tensor([f*self.patch_num+h*self.width+w+self.image_token_start_index,f*self.patch_num+(h+1)*self.width+w+self.image_token_start_index]))
+                                sims.append(bottom[f,h,w])
                 self.finish_merging=True
                 # 下侧相似度（对于每一列，计算相邻tokens的点积）
             token_mask = torch.ones(hidden_states.shape[:-1], dtype=torch.bool, device=device)
@@ -290,47 +304,31 @@ class FrameFusion(nn.Module):
                 graph_tensor=torch.stack(graph)
                 
 
-                components_dfs = find_connected_components_dfs(graph_tensor)
+                components_dfs = find_connected_components_dfs(torch.stack(graph))
+                
                 #org_hidden_states, org_token_mask = self.merge_tokens_and_get_mask(hidden_states, similarity_by_patch, token_index_by_patch, merge_index_by_patch)
-                if len(components_dfs)>0:
-                    unique_node=torch.flatten(graph_tensor)
-                    unique_node=torch.unique(unique_node)
-                    above_k_number = (unique_node.shape[0]-len(components_dfs)) 
-                    from pdb import set_trace
+                for index,_ in enumerate(components_dfs):
+                    for j in range(1,len(components_dfs[index])):
+                        token_mask[0, components_dfs[index][j]] = False
+                unique_node=torch.flatten(graph_tensor)
+                unique_node=torch.unique(unique_node)
+                above_k_ratio = (unique_node.shape[0]-len(components_dfs)) / frame_token_num
+                from pdb import set_trace
+                
+                if above_k_ratio >= sparsity_upper_bound:
+                    sim_sum=torch.zeros(hidden_states.shape[:-1],device=device)
+                    for index in range(len(sims)):
+                        sim_sum[0][graph_tensor[index][1]]+=sims[index]
                     
-                    if (above_k_number/ frame_token_num) >= sparsity_upper_bound:
-                        
-                        sum_weight=torch.zeros(len(components_dfs))
-                        for index in range(len(components_dfs)):
-                            cos_sim=F.cosine_similarity(hidden_states[0][components_dfs[index]],hidden_states[0][components_dfs[index]])
-                            cos_sim_sum=cos_sim.sum()/2/(len(cos_sim)-1)
-                            sum_weight[index]=cos_sim_sum.item()
-                            
-                        _,indices=torch.sort(sum_weight,descending=True)
-                        temp_index=0
-
-                        while temp_index<len(indices)and (above_k_number/ frame_token_num) >= sparsity_upper_bound:
-                            temp_comp=components_dfs[indices[temp_index]]
-                            above_k_number-=(len(temp_comp)-1)
-                            temp_index+=1
-
-                        for i in range(temp_index):
-                            components_dfs[indices[i]]=[]
-                        s=0
-                        for index,_ in enumerate(components_dfs):
-                            s+=len(components_dfs[index])
-                            for j in range(1,len(components_dfs[index])):
-                                token_mask[0, components_dfs[index][j]] = False
-  
-                        self.finish_merging=True
-                        self.finish_pruning=True
-
-                    else:
-                        self.sparsity_list.append(above_k_number/frame_token_num)
-                        for index,_ in enumerate(components_dfs):
-                            for j in range(1,len(components_dfs[index])):
-                                token_mask[0, components_dfs[index][j]] = False
-                        self.finish_merging = True
+                    _, indices = torch.topk(sim_sum, int(sparsity_upper_bound*frame_token_num))
+                    token_mask[0][indices]=False
+                    self.finish_merging = True
+                    self.finish_pruning = True
+                else:
+                    self.sparsity_list.append(above_k_ratio)
+                    for index,_ in enumerate(components_dfs):
+                        for j in range(1,len(components_dfs[index])):
+                            token_mask[0, components_dfs[index][j]] = False
                 
 
                 

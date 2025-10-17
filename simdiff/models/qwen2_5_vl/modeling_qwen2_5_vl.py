@@ -4,7 +4,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLCausalL
 from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import repeat_kv, apply_multimodal_rotary_pos_emb, logger
-from framefusion.utils import scaled_dot_product_attention
+from simdiff.utils import scaled_dot_product_attention
 
 
 SPECIAL_TOKEN = -9
@@ -126,7 +126,7 @@ def forward(
             patch_type = [TEXT_TOKEN] * image_token_start_index + list(range(patch_num)) * n_frames + [TEXT_TOKEN] * (original_length - image_token_end_index - 1)
             patch_type = torch.tensor([patch_type], device=inputs_embeds.device)
 
-            self.framefusion.prepare(
+            self.simdiff.prepare(
                 patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length,
                 height=height, width=width
             )
@@ -245,7 +245,7 @@ def Qwen2_5_VLDecoderLayer_merge_then_prune_by_cost_forward(
 
     ### start token merging at layer 0 before attention
     if self.self_attn.layer_idx == 0:
-        hidden_states, position_embeddings, attention_mask = self.framefusion(hidden_states, position_embeddings, attention_mask)
+        hidden_states, position_embeddings, attention_mask = self.simdiff(hidden_states, position_embeddings, attention_mask)
     ### end token merging at layer 0 before attention
 
     residual = hidden_states
@@ -266,7 +266,7 @@ def Qwen2_5_VLDecoderLayer_merge_then_prune_by_cost_forward(
     hidden_states = residual + hidden_states
 
     ### start token merging or fastv after attention
-    hidden_states, position_embeddings, attention_mask = self.framefusion(hidden_states, position_embeddings, attention_mask, self_attn_weights)
+    hidden_states, position_embeddings, attention_mask = self.simdiff(hidden_states, position_embeddings, attention_mask, self_attn_weights)
     ### end token merging or fastv after attention
 
     # Fully Connected
@@ -356,7 +356,7 @@ def Qwen2_5_VLSdpaAttention_merge_then_prune_by_cost_forward(
     
     ### start storing attn_weights if needed
     attn_weights = None
-    if (q_len > 1) and (self.framefusion.finish_merging) and (not self.framefusion.finish_pruning):        
+    if (q_len > 1) and (self.simdiff.finish_merging) and (not self.simdiff.finish_pruning):        
         attn_weights = scaled_dot_product_attention(
             query_states,
             key_states,
@@ -481,7 +481,7 @@ def Qwen2_5_VLModel_merge_then_fastv_cost_given_forward(
                 position_embeddings=position_embeddings,
             )
         
-        ### start update the attention mask and position embeddings modified by framefusion
+        ### start update the attention mask and position embeddings modified by simdiff
         position_embeddings = layer_outputs[-2]
         causal_mask = layer_outputs[-1]
         ### end changing position embedding

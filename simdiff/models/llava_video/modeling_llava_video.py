@@ -319,7 +319,7 @@ def prepare_inputs_labels_for_multimodal_get_patch_type(self, input_ids, positio
     # import pdb; pdb.set_trace()
     # rank0_print("Finish preparing")
 
-    ### FRAMEFUSION START ###
+    ### simdiff START ###
     if self.config.mm_spatial_pool_mode == "bilinear":
         patch_size = math.ceil(self.get_vision_tower().num_patches_per_side / 2)
     else:
@@ -343,7 +343,7 @@ def prepare_inputs_labels_for_multimodal_get_patch_type(self, input_ids, positio
     # print(n_frames)
     # print(original_length)
     # print(image_token_end_index)
-    self.framefusion.prepare(patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length)
-    ### FRAMEFUSION END ###
+    self.simdiff.prepare(patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length)
+    ### simdiff END ###
 
     return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels

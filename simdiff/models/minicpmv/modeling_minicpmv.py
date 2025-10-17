@@ -87,7 +87,7 @@ def get_vllm_embedding(self, data):
             elif self.training:
                 cur_vllm_emb += cur_vs_hs[0].mean() * 0
 
-    ### FRAMEFUSION START ###
+    ### simdiff START ###
     assert bs == 1
     patch_type = torch.full((bs, vllm_embedding.shape[1]), TEXT_TOKEN, dtype=torch.long, device=vllm_embedding.device)
     num_frames = self.num_frames
@@ -103,7 +103,7 @@ def get_vllm_embedding(self, data):
     original_length = patch_type.shape[1]
     image_token_length = image_token_end_index - image_token_start_index + 1
 
-    self.framefusion.prepare(patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length)
-    ### FRAMEFUSION END ###
+    self.simdiff.prepare(patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length)
+    ### simdiff END ###
 
     return vllm_embedding, vision_hidden_states

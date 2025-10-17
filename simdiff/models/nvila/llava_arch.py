@@ -37,7 +37,7 @@ def _embed(
         for name, token_id in self.tokenizer.media_token_ids.items():
             media_tokens[token_id] = name
 
-        ### start modification by framefusion ###
+        ### start modification by simdiff ###
         if isinstance(self.config.video_encoder, dict) and 'pool_sizes' in self.config.video_encoder:
             pool_sizes = self.config.video_encoder['pool_sizes'][0][0]
         else:
@@ -54,7 +54,7 @@ def _embed(
             patch_type = torch.full((batch_size, length), TEXT_TOKEN, dtype=torch.long, device = text_embeds[0].device)
             patch_num = 1
             num_frames = media_embeds['image'][0].shape[0]
-        ### end modification by framefusion ###
+        ### end modification by simdiff ###
 
 
         # Fuse text and media embeddings
@@ -80,12 +80,12 @@ def _embed(
             inputs_m.append(torch.cat(inputs_mk, dim=0))
             labels_m.append(torch.cat(labels_mk, dim=0))
 
-            ### start modification by framefusion ###
+            ### start modification by simdiff ###
             seq = torch.arange(patch_num, device = patch_type.device).repeat(int(num_frames))
             patch_type[k, inputs_mk[0].shape[0]:inputs_mk[0].shape[0]+inputs_mk[1].shape[0]] = seq
-            ### end modification by framefusion ###
+            ### end modification by simdiff ###
 
-        ### Framefusion edit start ###
+        ### simdiff edit start ###
         image_token_start_index = torch.argmax((patch_type >=0).int(), dim=1)
         image_token_end_index = patch_type.shape[1]-1-torch.argmax((torch.flip(patch_type, dims=[1]) >=0).int(), dim=1)
         original_length = patch_type.shape[1]
@@ -97,8 +97,8 @@ def _embed(
         self.image_token_end_index = image_token_end_index
         self.image_token_length = image_token_length
         self.original_length = original_length
-        self.framefusion.prepare(patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length)
-        ### Framefusion edit end ###
+        self.simdiff.prepare(patch_type, patch_num, image_token_start_index, image_token_end_index, image_token_length, original_length)
+        ### simdiff edit end ###
 
         inputs, labels = inputs_m, labels_m
 
